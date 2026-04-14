@@ -19,6 +19,25 @@ import (
 	"go.uber.org/zap"
 )
 
+var stdoutMu sync.Mutex
+
+func writeToStdout(b []byte) (int, error) {
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
+	return os.Stdout.Write(b)
+}
+
+func sendLCPTerminate(logger *zap.Logger) {
+	termReq := buildLCPPacket(lcpTermRequest, 1, nil)
+	frame := makePPPFrame(pppProtoLCP, termReq)
+	if _, err := writeToStdout(EncodeHDLC(frame)); err != nil {
+		logger.Debug("failed to send LCP Terminate-Request", zap.Error(err))
+		return
+	}
+	logger.Info("sent LCP Terminate-Request to server")
+	time.Sleep(200 * time.Millisecond)
+}
+
 // PPP protocols used by MLPPP
 const (
 	pppProtoMP     uint16 = 0x003D
@@ -180,10 +199,67 @@ type mlpppLCPState struct {
 	peerAccepted  bool
 	sentRequest   bool
 	nextID        uint8
+	lastReqID     uint8
 
 	wantShortSeq          bool
 	shortSeqRejected      bool
 	peerRequestedShortSeq bool
+}
+
+type bridgeAuthState struct {
+	upstreamProto uint16
+	windowsDone   bool
+	upstreamDone  bool
+	nakCount      int
+}
+
+func (s *bridgeAuthState) resetForLCP() {
+	s.windowsDone = false
+	s.upstreamDone = false
+}
+
+func (s *bridgeAuthState) setUpstreamProto(proto uint16) {
+	s.upstreamProto = proto
+	s.nakCount = 0
+	s.resetForLCP()
+}
+
+func (s *bridgeAuthState) noteUnsupportedProposal() error {
+	s.nakCount++
+	if s.nakCount > 10 {
+		return fmt.Errorf("upstream peer refused PAP fallback after %d Config-Nak attempts", s.nakCount-1)
+	}
+	return nil
+}
+
+func (s *bridgeAuthState) onWindowsPAPSuccess() (bool, error) {
+	s.windowsDone = true
+	switch s.upstreamProto {
+	case 0:
+		return false, nil
+	case pppProtoPAP:
+		return true, nil
+	default:
+		return false, fmt.Errorf("unsupported upstream auth method 0x%04x", s.upstreamProto)
+	}
+}
+
+func (s *bridgeAuthState) markUpstreamPAPDone() {
+	s.upstreamDone = true
+}
+
+func (s *bridgeAuthState) ready() bool {
+	if !s.windowsDone {
+		return false
+	}
+	switch s.upstreamProto {
+	case 0:
+		return true
+	case pppProtoPAP:
+		return s.upstreamDone
+	default:
+		return false
+	}
 }
 
 func newMLPPPLCPState(magic uint32, mru uint16, mrru uint16, discriminator []byte) *mlpppLCPState {
@@ -234,11 +310,17 @@ func (s *mlpppLCPState) HandleLCP(payload []byte) [][]byte {
 		return resp
 
 	case lcpConfigAck:
+		if id != s.lastReqID {
+			return nil
+		}
 		s.peerAccepted = true
 		s.checkOpen()
 		return nil
 
 	case lcpConfigNak:
+		if id != s.lastReqID {
+			return nil
+		}
 		s.peerAccepted = false
 		if len(payload) > 4 {
 			options := payload[4:]
@@ -258,6 +340,9 @@ func (s *mlpppLCPState) HandleLCP(payload []byte) [][]byte {
 		return [][]byte{makePPPFrame(pppProtoLCP, req)}
 
 	case lcpConfigReject:
+		if id != s.lastReqID {
+			return nil
+		}
 		s.peerAccepted = false
 		if len(payload) > 4 {
 			rejected := payload[4:]
@@ -415,6 +500,7 @@ func buildMLPPPOptions(mrru uint16, discriminator []byte, shortSeq bool) []byte 
 
 func (s *mlpppLCPState) buildConfigRequest() []byte {
 	s.nextID++
+	s.lastReqID = s.nextID
 	var opts []byte
 
 	opts = append(opts, lcpOptMRU, 4)
@@ -591,7 +677,7 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 	} else if b.MTU > 0 {
 		vpnMTU = uint16(b.MTU)
 	}
-	mpNegotiated := false
+	var mpNegotiated atomic.Bool
 
 	var mssClampMTU int
 	if b.MSSClamp == nil {
@@ -624,6 +710,7 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 	var sstpMu sync.Mutex
 	var fragSeq atomic.Uint32
 	sstpBuf := bufio.NewWriterSize(sstpConn, 16384)
+	var negMu sync.Mutex
 
 	var injectedOpts []byte
 	var strippedOpts []byte
@@ -632,8 +719,9 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 	var peerRequestedShortSeq bool
 	var serverAcked bool
 	var windowsAcked bool
-	var windowsPAPDone bool
-	var serverPAPDone bool
+	var lastToServerReqID uint8
+	var lastToWindowsReqID uint8
+	var authState bridgeAuthState
 	var startBroadcasted bool
 	var windowsMRU uint16
 
@@ -649,8 +737,15 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 	}
 
 	sendToServer := func(pppFrame []byte) error {
-		_, err := os.Stdout.Write(EncodeHDLC(pppFrame))
+		_, err := writeToStdout(EncodeHDLC(pppFrame))
 		return err
+	}
+
+	authReady := func() bool {
+		negMu.Lock()
+		ready := authState.ready()
+		negMu.Unlock()
+		return ready
 	}
 
 	tryBroadcastStart := func() {
@@ -660,7 +755,10 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 		if startBroadcasted {
 			return
 		}
-		if !serverAcked || !windowsAcked || !windowsPAPDone || !serverPAPDone {
+		if !serverAcked || !windowsAcked {
+			return
+		}
+		if !authState.ready() {
 			return
 		}
 		if shortSeqRejected {
@@ -671,8 +769,12 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 			errCh <- errors.New("server did not request short-seq, cannot use short format")
 			return
 		}
+		if relayMRRU == 0 {
+			b.Logger.Warn("MRRU rejected by server, falling back to single-link (no MP)")
+			return
+		}
 		startBroadcasted = true
-		mpNegotiated = true
+		mpNegotiated.Store(true)
 		b.Logger.Info("LCP relay complete, broadcasting start to workers",
 			zap.Uint16("mrru", relayMRRU),
 			zap.Bool("shortSeq", true),
@@ -723,11 +825,16 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 				mt := binary.BigEndian.Uint16(pppFrame[0:2])
 				switch mt {
 				case sstpMsgCallConnected:
-					if err := verifyCryptoBinding(pppFrame[4:], nonce, certHash); err != nil {
-						b.Logger.Warn("SSTP CryptoBinding verification failed", zap.Error(err))
-					} else {
-						b.Logger.Info("SSTP CALL_CONNECTED verified")
+					if err := verifyCryptoBinding(pppFrame, nonce, certHash); err != nil {
+						b.Logger.Error("SSTP CryptoBinding verification failed, aborting", zap.Error(err))
+						sstpMu.Lock()
+						_ = writeSSTPControl(sstpBuf, sstpMsgCallAbort, nil)
+						_ = sstpBuf.Flush()
+						sstpMu.Unlock()
+						errCh <- fmt.Errorf("CryptoBinding verification failed: %w", err)
+						return
 					}
+					b.Logger.Info("SSTP CALL_CONNECTED verified")
 					if rs != nil {
 						go rs.ApplyRoutes()
 					}
@@ -738,7 +845,10 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 				sstpMu.Unlock()
 			case sstpMsgCallDisconnect:
 				errCh <- errors.New("SSTP client disconnected")
-				_ = writeSSTPControl(sstpConn, sstpMsgCallDisconnectAck, nil)
+				sstpMu.Lock()
+				_ = writeSSTPControl(sstpBuf, sstpMsgCallDisconnectAck, nil)
+				_ = sstpBuf.Flush()
+				sstpMu.Unlock()
 					return
 				case sstpMsgCallAbort:
 					errCh <- errors.New("SSTP client aborted")
@@ -758,19 +868,16 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 				opts := payload[4:]
 				switch code {
 			case lcpConfigRequest:
+				negMu.Lock()
 				if mru := extractMRU(opts); mru > 0 {
 					windowsMRU = mru
-					b.Logger.Info("Windows LCP MRU detected",
-						zap.Uint16("windowsMRU", windowsMRU),
-						zap.Uint16("vpnMTU", vpnMTU))
 					if windowsMRU < vpnMTU {
 						vpnMTU = windowsMRU
-						b.Logger.Info("Adjusted vpnMTU to match Windows MRU",
-							zap.Uint16("vpnMTU", vpnMTU))
 					}
 				}
 				rejOpts, cleanOpts := splitRejectableOptions(opts)
 				if len(rejOpts) > 0 {
+					negMu.Unlock()
 					b.Logger.Info("LCP Config-Reject (Bridge->Windows)",
 						zap.Int("rejectedLen", len(rejOpts)))
 					pkt := buildLCPPacket(lcpConfigReject, id, rejOpts)
@@ -778,30 +885,48 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 						errCh <- err
 						return
 					}
-					continue // wait for Windows to resend without rejected options
+					continue
 				}
+				var outFrame []byte
 				if mlpppMode {
 					injectedOpts = buildMLPPPOptions(relayMRRU, discriminator, !shortSeqRejected)
 					augmented := append(append([]byte(nil), cleanOpts...), injectedOpts...)
-					pkt := buildLCPPacket(lcpConfigRequest, id, augmented)
-					if err := sendToServer(makePPPFrame(pppProtoLCP, pkt)); err != nil {
+					outFrame = makePPPFrame(pppProtoLCP, buildLCPPacket(lcpConfigRequest, id, augmented))
+				}
+				authState.resetForLCP()
+				serverAcked = false
+				lastToServerReqID = id
+				logMRRU := relayMRRU
+				negMu.Unlock()
+				if mlpppMode {
+					if err := sendToServer(outFrame); err != nil {
 						errCh <- err
 						return
 					}
 					b.Logger.Info("LCP Config-Request (Windows->Server)",
 						zap.Int("injectedOptsLen", len(injectedOpts)),
-						zap.Uint16("relayMRRU", relayMRRU))
+						zap.Uint16("relayMRRU", logMRRU))
 				} else {
-						if err := sendToServer(pppFrame); err != nil {
-							errCh <- err
-							return
-						}
+					if err := sendToServer(pppFrame); err != nil {
+						errCh <- err
+						return
+					}
 				}
-				serverAcked = false
 				case lcpConfigAck:
-					if mlpppMode {
-						pkt := buildLCPPacket(lcpConfigAck, id, serverReqOpts)
-						if err := sendToServer(makePPPFrame(pppProtoLCP, pkt)); err != nil {
+					negMu.Lock()
+					var outFrame []byte
+					if len(serverReqOpts) > 0 {
+						outFrame = makePPPFrame(pppProtoLCP, buildLCPPacket(lcpConfigAck, id, serverReqOpts))
+					}
+					if id == lastToWindowsReqID {
+						windowsAcked = true
+						tryBroadcastStart()
+					}
+					logWinAcked := windowsAcked
+					negMu.Unlock()
+					b.Logger.Info("LCP Config-Ack (Windows->Server)", zap.Bool("windowsAcked", logWinAcked))
+					if outFrame != nil {
+						if err := sendToServer(outFrame); err != nil {
 							errCh <- err
 							return
 						}
@@ -811,15 +936,16 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 							return
 						}
 					}
-					windowsAcked = true
-					b.Logger.Info("LCP Config-Ack (Windows->Server)", zap.Bool("windowsAcked", true))
-					tryBroadcastStart()
 				case lcpConfigNak, lcpConfigReject:
+					negMu.Lock()
+					if id == lastToWindowsReqID {
+						windowsAcked = false
+					}
+					negMu.Unlock()
 					if err := sendToServer(pppFrame); err != nil {
 						errCh <- err
 						return
 					}
-					windowsAcked = false
 				default:
 					if err := sendToServer(pppFrame); err != nil {
 						errCh <- err
@@ -832,22 +958,30 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 					peerUser, peerPass := parsePAPAuthRequest(payload)
 					if peerUser == papLocalUser && peerPass == papLocalPass {
 						_ = sendToWindows(buildPAPResponse(2, payload[1], "OK"))
-						windowsPAPDone = true
+						negMu.Lock()
+						sendUpstreamPAP, authErr := authState.onWindowsPAPSuccess()
+						tryBroadcastStart()
+						negMu.Unlock()
+						if authErr != nil {
+							errCh <- authErr
+							return
+						}
 						b.Logger.Info("PAP authentication succeeded (Windows)")
-						if b.PAPUser != "" {
-							papReq := buildPAPAuthRequest(1, b.PAPUser, b.PAPPass)
-							if err := sendToServer(papReq); err != nil {
-								errCh <- err
-								return
-							}
-						} else {
-							papReq := buildPAPAuthRequest(1, peerUser, peerPass)
-							if err := sendToServer(papReq); err != nil {
-								errCh <- err
-								return
+						if sendUpstreamPAP {
+							if b.PAPUser != "" {
+								papReq := buildPAPAuthRequest(1, b.PAPUser, b.PAPPass)
+								if err := sendToServer(papReq); err != nil {
+									errCh <- err
+									return
+								}
+							} else {
+								papReq := buildPAPAuthRequest(1, peerUser, peerPass)
+								if err := sendToServer(papReq); err != nil {
+									errCh <- err
+									return
+								}
 							}
 						}
-						tryBroadcastStart()
 					} else {
 						_ = sendToWindows(buildPAPResponse(3, payload[1], "bad credentials"))
 						errCh <- errors.New("Windows PAP auth failed")
@@ -856,7 +990,11 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 				}
 
 			default:
-				if mpNegotiated {
+				if !authReady() {
+					b.Logger.Debug("dropping pre-auth PPP frame from Windows", zap.Uint16("proto", proto))
+					continue
+				}
+				if mpNegotiated.Load() {
 					off := 0
 					if len(pppFrame) >= 2 && pppFrame[0] == 0xFF && pppFrame[1] == 0x03 {
 						off = 2
@@ -878,7 +1016,7 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 						ClampTCPMSS(pppFrame, mssClampMTU, "tx", b.Logger)
 					}
 					hdlcFrame := EncodeHDLC(pppFrame)
-					if _, err := os.Stdout.Write(hdlcFrame); err != nil {
+					if _, err := writeToStdout(hdlcFrame); err != nil {
 						errCh <- fmt.Errorf("stdout write error: %w", err)
 						return
 					}
@@ -922,6 +1060,9 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 							switch code {
 							case lcpConfigRequest:
 								mlpppOpts, restOpts := splitOptions(opts)
+								negMu.Lock()
+								serverReqOpts = nil
+								windowsAcked = false
 								for scan := mlpppOpts; len(scan) >= 2; {
 									optLen := int(scan[1])
 									if optLen < 2 || optLen > len(scan) {
@@ -932,42 +1073,63 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 									}
 									scan = scan[optLen:]
 								}
-								nakOpts := buildMRUNak(restOpts, vpnMTU)
-								if len(nakOpts) > 0 {
+								decision := mediateServerLCPForBridge(restOpts, vpnMTU)
+								if len(decision.NakOpts) > 0 {
+									if decision.UpstreamAuthProto != 0 && decision.UpstreamAuthProto != pppProtoPAP {
+										if err := authState.noteUnsupportedProposal(); err != nil {
+											negMu.Unlock()
+											errCh <- err
+											return
+										}
+									}
+									logVpnMTU := vpnMTU
+									negMu.Unlock()
 									b.Logger.Info("LCP Config-Nak (Bridge->Server)",
-										zap.Int("nakOptsLen", len(nakOpts)),
-										zap.Uint16("vpnMTU", vpnMTU))
-									pkt := buildLCPPacket(lcpConfigNak, id, nakOpts)
+										zap.Int("nakOptsLen", len(decision.NakOpts)),
+										zap.Uint16("vpnMTU", logVpnMTU))
+									pkt := buildLCPPacket(lcpConfigNak, id, decision.NakOpts)
 									if err := sendToServer(makePPPFrame(pppProtoLCP, pkt)); err != nil {
 										errCh <- err
 										return
 									}
 								} else {
+									rewrite := decision
 									serverReqOpts = append([]byte(nil), opts...)
 									strippedOpts = mlpppOpts
+									authState.setUpstreamProto(rewrite.UpstreamAuthProto)
+									logPeerShortSeq := peerRequestedShortSeq
+									logVpnMTU := vpnMTU
+									lastToWindowsReqID = id
+									negMu.Unlock()
 									b.Logger.Info("LCP Config-Request (Server->Windows)",
 										zap.Int("strippedOptsLen", len(strippedOpts)),
-										zap.Bool("peerRequestedShortSeq", peerRequestedShortSeq),
-										zap.Uint16("vpnMTU", vpnMTU))
-									pkt := buildLCPPacket(lcpConfigRequest, id, restOpts)
+										zap.Bool("peerRequestedShortSeq", logPeerShortSeq),
+										zap.Uint16("vpnMTU", logVpnMTU),
+										zap.Uint16("serverAuthProto", rewrite.UpstreamAuthProto))
+									pkt := buildLCPPacket(lcpConfigRequest, id, rewrite.WindowsOpts)
 									if err := sendToWindows(makePPPFrame(pppProtoLCP, pkt)); err != nil {
 										errCh <- err
 										return
 									}
-									windowsAcked = false
 								}
 							case lcpConfigAck:
 								_, restOpts := splitOptions(opts)
+								negMu.Lock()
+								if id == lastToServerReqID {
+									serverAcked = true
+									tryBroadcastStart()
+								}
+								logSrvAcked := serverAcked
+								negMu.Unlock()
+								b.Logger.Info("LCP Config-Ack (Server->Windows)", zap.Bool("serverAcked", logSrvAcked))
 								pkt := buildLCPPacket(lcpConfigAck, id, restOpts)
 								if err := sendToWindows(makePPPFrame(pppProtoLCP, pkt)); err != nil {
 									errCh <- err
 									return
 								}
-								serverAcked = true
-								b.Logger.Info("LCP Config-Ack (Server->Windows)", zap.Bool("serverAcked", true))
-								tryBroadcastStart()
 							case lcpConfigNak:
 								mlpppOpts, restOpts := splitOptions(opts)
+								negMu.Lock()
 								for scan := mlpppOpts; len(scan) >= 2; {
 									optLen := int(scan[1])
 									if optLen < 2 || optLen > len(scan) {
@@ -982,6 +1144,10 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 									}
 									scan = scan[optLen:]
 								}
+								if id == lastToServerReqID {
+									serverAcked = false
+								}
+								negMu.Unlock()
 								if len(restOpts) > 0 {
 									pkt := buildLCPPacket(lcpConfigNak, id, restOpts)
 									if err := sendToWindows(makePPPFrame(pppProtoLCP, pkt)); err != nil {
@@ -989,9 +1155,9 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 										return
 									}
 								}
-								serverAcked = false
 							case lcpConfigReject:
 								mlpppOpts, restOpts := splitOptions(opts)
+								negMu.Lock()
 								for scan := mlpppOpts; len(scan) >= 2; {
 									optLen := int(scan[1])
 									if optLen < 2 || optLen > len(scan) {
@@ -1007,6 +1173,10 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 									}
 									scan = scan[optLen:]
 								}
+								if id == lastToServerReqID {
+									serverAcked = false
+								}
+								negMu.Unlock()
 								if len(restOpts) > 0 {
 									pkt := buildLCPPacket(lcpConfigReject, id, restOpts)
 									if err := sendToWindows(makePPPFrame(pppProtoLCP, pkt)); err != nil {
@@ -1014,7 +1184,6 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 										return
 									}
 								}
-								serverAcked = false
 							default:
 								if err := sendToWindows(rawPPP); err != nil {
 									errCh <- err
@@ -1024,29 +1193,49 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 						} else {
 							switch code {
 							case lcpConfigRequest:
-								if vpnMTU > 0 {
-									nakOpts := buildMRUNak(opts, vpnMTU)
-									if len(nakOpts) > 0 {
-										b.Logger.Info("LCP Config-Nak (Bridge->Server)",
-											zap.Int("nakOptsLen", len(nakOpts)),
-											zap.Uint16("vpnMTU", vpnMTU))
-										pkt := buildLCPPacket(lcpConfigNak, id, nakOpts)
-										if err := sendToServer(makePPPFrame(pppProtoLCP, pkt)); err != nil {
+								negMu.Lock()
+								serverReqOpts = nil
+								windowsAcked = false
+								decision := mediateServerLCPForBridge(opts, vpnMTU)
+								if len(decision.NakOpts) > 0 {
+									if decision.UpstreamAuthProto != 0 && decision.UpstreamAuthProto != pppProtoPAP {
+										if err := authState.noteUnsupportedProposal(); err != nil {
+											negMu.Unlock()
 											errCh <- err
 											return
 										}
-										break
 									}
+									logVpnMTU := vpnMTU
+									negMu.Unlock()
+									b.Logger.Info("LCP Config-Nak (Bridge->Server)",
+										zap.Int("nakOptsLen", len(decision.NakOpts)),
+										zap.Uint16("vpnMTU", logVpnMTU))
+									pkt := buildLCPPacket(lcpConfigNak, id, decision.NakOpts)
+									if err := sendToServer(makePPPFrame(pppProtoLCP, pkt)); err != nil {
+										errCh <- err
+										return
+									}
+									break
 								}
-								serverReqOpts = append([]byte(nil), opts...)
-								windowsAcked = false
-								if err := sendToWindows(rawPPP); err != nil {
+								rewrite := decision
+								serverReqOpts = rewrite.OriginalOpts
+								authState.setUpstreamProto(rewrite.UpstreamAuthProto)
+								lastToWindowsReqID = id
+								negMu.Unlock()
+								pkt := buildLCPPacket(lcpConfigRequest, id, rewrite.WindowsOpts)
+								if err := sendToWindows(makePPPFrame(pppProtoLCP, pkt)); err != nil {
 									errCh <- err
 									return
 								}
 							case lcpConfigAck:
-								serverAcked = true
-								b.Logger.Info("LCP Config-Ack (Server->Windows)", zap.Bool("serverAcked", true))
+								negMu.Lock()
+								if id == lastToServerReqID {
+									serverAcked = true
+									tryBroadcastStart()
+								}
+								logSrvAcked := serverAcked
+								negMu.Unlock()
+								b.Logger.Info("LCP Config-Ack (Server->Windows)", zap.Bool("serverAcked", logSrvAcked))
 								if err := sendToWindows(rawPPP); err != nil {
 									errCh <- err
 									return
@@ -1062,19 +1251,30 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 					case proto == pppProtoPAP:
 						if len(payload) >= 1 {
 							if payload[0] == 2 {
-								b.Logger.Info("PAP authentication succeeded (server)")
-								serverPAPDone = true
-								b.Logger.Info("PAP completed",
-									zap.Bool("windowsPAPDone", windowsPAPDone),
-									zap.Bool("serverPAPDone", serverPAPDone))
+								negMu.Lock()
+								authState.markUpstreamPAPDone()
+								logWinPAP := authState.windowsDone
 								tryBroadcastStart()
+								negMu.Unlock()
+								b.Logger.Info("PAP authentication succeeded (server)")
+								b.Logger.Info("PAP completed",
+									zap.Bool("windowsAuthDone", logWinPAP),
+									zap.Bool("serverAuthDone", true))
 							} else if payload[0] == 3 {
 								errCh <- errors.New("PAP authentication rejected by server")
 								return
 							}
 						}
 
+				case proto == pppProtoCHAP || proto == pppProtoEAP:
+					errCh <- fmt.Errorf("received unsupported auth protocol 0x%04x from server", proto)
+					return
+
 				case proto == pppProtoMP:
+					if !authReady() {
+						b.Logger.Debug("dropping pre-auth PPP frame from server", zap.Uint16("proto", proto))
+						continue
+					}
 					if assembled := reassembly.AddFragment(rawPPP); assembled != nil {
 						select {
 						case toWindows <- assembled:
@@ -1089,7 +1289,11 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 					}
 
 				default:
-					if mpNegotiated {
+					if !authReady() {
+						b.Logger.Debug("dropping pre-auth PPP frame from server", zap.Uint16("proto", proto))
+						continue
+					}
+					if mpNegotiated.Load() {
 						select {
 						case toWindows <- rawPPP:
 						default:
@@ -1186,7 +1390,9 @@ func (b *SSTPBridge) bridgeLoop(sstpConn net.Conn, sstpReader *bufio.Reader, non
 	}
 	wg.Wait()
 
-	if !mpNegotiated && relayMRRU == 0 && b.Discriminator == "" {
+	sendLCPTerminate(b.Logger)
+
+	if !mpNegotiated.Load() && relayMRRU == 0 && b.Discriminator == "" {
 		b.Logger.Info("Single-link PPP mode")
 	}
 
@@ -1274,7 +1480,7 @@ func (w *MLPPPWorker) runWorker(client *IPCClient) error {
 	errCh := make(chan error, 3)
 
 	initFrame := srvLCP.InitialRequest()
-	if _, err := os.Stdout.Write(EncodeHDLC(initFrame)); err != nil {
+	if _, err := writeToStdout(EncodeHDLC(initFrame)); err != nil {
 		return fmt.Errorf("failed to send initial LCP to server: %w", err)
 	}
 
@@ -1301,7 +1507,7 @@ func (w *MLPPPWorker) runWorker(client *IPCClient) error {
 					case proto == pppProtoLCP:
 						responses := srvLCP.HandleLCP(payload)
 						for _, resp := range responses {
-							if _, werr := os.Stdout.Write(EncodeHDLC(resp)); werr != nil {
+							if _, werr := writeToStdout(EncodeHDLC(resp)); werr != nil {
 								errCh <- werr
 								return
 							}
@@ -1320,7 +1526,7 @@ func (w *MLPPPWorker) runWorker(client *IPCClient) error {
 						}
 						if srvLCP.IsOpen() && w.PAPUser != "" && !papSent {
 							papReq := buildPAPAuthRequest(1, w.PAPUser, w.PAPPass)
-							if _, werr := os.Stdout.Write(EncodeHDLC(papReq)); werr != nil {
+							if _, werr := writeToStdout(EncodeHDLC(papReq)); werr != nil {
 								errCh <- werr
 								return
 							}
@@ -1362,7 +1568,7 @@ func (w *MLPPPWorker) runWorker(client *IPCClient) error {
 				return
 			}
 			if msg.Type == ipcMsgTXFragment {
-				if _, err := os.Stdout.Write(EncodeHDLC(msg.Payload)); err != nil {
+				if _, err := writeToStdout(EncodeHDLC(msg.Payload)); err != nil {
 					errCh <- fmt.Errorf("stdout write failed: %w", err)
 					return
 				}
@@ -1370,7 +1576,9 @@ func (w *MLPPPWorker) runWorker(client *IPCClient) error {
 		}
 	}()
 
-	return <-errCh
+	workerErr := <-errCh
+	sendLCPTerminate(w.Logger)
+	return workerErr
 }
 
 func buildPAPAuthRequest(id byte, user, pass string) []byte {

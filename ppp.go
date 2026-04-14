@@ -6,8 +6,10 @@ import (
 
 // PPP protocol numbers
 const (
-	pppProtoLCP uint16 = 0xC021
-	pppProtoPAP uint16 = 0xC023
+	pppProtoLCP  uint16 = 0xC021
+	pppProtoPAP  uint16 = 0xC023
+	pppProtoCHAP uint16 = 0xC223
+	pppProtoEAP  uint16 = 0xC227
 )
 
 // LCP code values
@@ -63,6 +65,69 @@ func buildLCPPacket(code uint8, id byte, options []byte) []byte {
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(pktLen))
 	copy(pkt[4:], options)
 	return pkt
+}
+
+func stripAuthProto(opts []byte) (authProto uint16, stripped []byte) {
+	for len(opts) >= 2 {
+		optType := opts[0]
+		optLen := int(opts[1])
+		if optLen < 2 || optLen > len(opts) {
+			break
+		}
+		if optType == lcpOptAuthProtocol && optLen >= 4 {
+			authProto = binary.BigEndian.Uint16(opts[2:4])
+		} else {
+			stripped = append(stripped, opts[:optLen]...)
+		}
+		opts = opts[optLen:]
+	}
+	return
+}
+
+type rewrittenServerLCP struct {
+	UpstreamAuthProto uint16
+	OriginalOpts      []byte
+	WindowsOpts       []byte
+	NakOpts           []byte
+}
+
+var lcpOptPAP = []byte{lcpOptAuthProtocol, 4, 0xC0, 0x23}
+
+func rewriteServerLCPForWindows(opts []byte) rewrittenServerLCP {
+	authProto, stripped := stripAuthProto(opts)
+	windowsOpts := append([]byte(nil), stripped...)
+	windowsOpts = append(windowsOpts, lcpOptPAP...)
+	return rewrittenServerLCP{
+		UpstreamAuthProto: authProto,
+		OriginalOpts:      append([]byte(nil), opts...),
+		WindowsOpts:       windowsOpts,
+	}
+}
+
+func mediateServerLCPForBridge(opts []byte, maxMRU uint16) rewrittenServerLCP {
+	authProto, stripped := stripAuthProto(opts)
+	var nakOpts []byte
+	if maxMRU > 0 {
+		nakOpts = append(nakOpts, buildMRUNak(opts, maxMRU)...)
+	}
+	if authProto != 0 && authProto != pppProtoPAP {
+		nakOpts = append(nakOpts, lcpOptPAP...)
+	}
+	if len(nakOpts) > 0 {
+		return rewrittenServerLCP{
+			UpstreamAuthProto: authProto,
+			OriginalOpts:      append([]byte(nil), opts...),
+			NakOpts:           nakOpts,
+		}
+	}
+
+	windowsOpts := append([]byte(nil), stripped...)
+	windowsOpts = append(windowsOpts, lcpOptPAP...)
+	return rewrittenServerLCP{
+		UpstreamAuthProto: authProto,
+		OriginalOpts:      append([]byte(nil), opts...),
+		WindowsOpts:       windowsOpts,
+	}
 }
 
 func buildPAPResponse(code uint8, id byte, msg string) []byte {
